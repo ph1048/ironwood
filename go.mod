@@ -1,6 +1,6 @@
 module github.com/Arceliar/ironwood
 
-go 1.21
+go 1.26.1
 
 require (
 	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d
@@ -12,3 +12,5 @@ require (
 	github.com/bits-and-blooms/bitset v1.13.0 // indirect
 	golang.org/x/sys v0.20.0 // indirect
 )
+
+replace github.com/Arceliar/phony => ./phony

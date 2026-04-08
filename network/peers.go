@@ -71,7 +71,6 @@ func (ps *peers) addPeer(key publicKey, conn net.Conn, prio uint8) (*peer, error
 		p.monitor.peer = p
 		p.monitor.pDelay = ps.core.config.peerTimeout // It doesn't make sense to start the ping delay any shorter than this
 		p.writer.peer = p
-		p.writer.wbuf = bufio.NewWriter(p.conn)
 		p.order = ps.order
 		ps.order++
 		ps.peers[p.key][p] = struct{}{}
@@ -179,15 +178,14 @@ func (m *peerMonitor) recv(pType wirePacketType) {
 
 type peerWriter struct {
 	phony.Inbox
-	peer *peer
-	wbuf *bufio.Writer
-	seq  uint64
+	peer      *peer
+	seq       uint64
+	encodeBuf []byte // reusable buffer for wire encoding
 }
 
 func (w *peerWriter) _write(bs []byte, pType wirePacketType) {
 	w.peer.monitor.sent(pType)
-	// _, _ = w.peer.conn.Write(bs)
-	_, _ = w.wbuf.Write(bs)
+	_, _ = w.peer.conn.Write(bs)
 	w.seq++
 	seq := w.seq
 	w.Act(nil, func() {
@@ -203,18 +201,22 @@ func (w *peerWriter) sendPacket(pType wirePacketType, data wireEncodeable, done 
 		if bufSize > w.peer.peers.core.config.peerMaxMessageSize {
 			return
 		}
-		writeBuf := allocBytes(0)
-		defer freeBytes(writeBuf)
+		// Reuse the writer's encode buffer instead of alloc/free per packet
+		w.encodeBuf = w.encodeBuf[:0]
 		// The +1 is from 1 byte for the pType
-		writeBuf = binary.AppendUvarint(writeBuf[:], bufSize)
+		w.encodeBuf = binary.AppendUvarint(w.encodeBuf, bufSize)
 		var err error
-		writeBuf, err = wireEncode(writeBuf, byte(pType), data)
+		w.encodeBuf, err = wireEncode(w.encodeBuf, byte(pType), data)
 		if err != nil {
 			panic(err)
 		}
-		w._write(writeBuf, pType)
+		w._write(w.encodeBuf, pType)
 		switch tr := data.(type) {
 		case *traffic:
+			if tr.onSent != nil {
+				tr.onSent()
+				tr.onSent = nil
+			}
 			freeTraffic(tr)
 		default:
 			// Not a special case, don't free anything
@@ -430,14 +432,43 @@ func (p *peer) _push(packet pqPacket) {
 		p.ready = false
 		return
 	}
-	// We're waiting, so queue the packet up for later
-	if info, ok := p.queue.peek(); ok && time.Since(info.time) > 25*time.Millisecond {
-		// The queue already has a significant delay
-		// Drop the oldest packet from the larget queue to make room
-		p.queue.drop()
+	// Size-based drops: enforce max queue size
+	maxSize := p.peers.core.config.peerMaxQueueSize
+	for p.queue.size > 0 && p.queue.size+uint64(packet.size()) > maxSize {
+		dropped, ok := p.queue.drop()
+		if !ok {
+			break
+		}
+		p._handleDropped(dropped)
+	}
+	// Time-based drops: drop stale packets
+	if info, ok := p.queue.peek(); ok && time.Since(info.time) > p.peers.core.config.peerQueueTimeout {
+		if dropped, ok := p.queue.drop(); ok {
+			p._handleDropped(dropped)
+		}
 	}
 	// Add the packet to the queue
 	p.queue.push(packet)
+}
+
+// _handleDropped frees a dropped packet. If it had a flow control callback,
+// the release is delayed to apply backpressure to the sender.
+func (p *peer) _handleDropped(packet pqPacket) {
+	switch tr := packet.(type) {
+	case *traffic:
+		if tr.onSent != nil {
+			onSent := tr.onSent
+			tr.onSent = nil
+			// Penalty delay: hold the semaphore slot briefly before releasing.
+			// This throttles the sender when drops occur, but doesn't stall it
+			// completely. 1ms per drop is enough to slow a 100K pps sender to
+			// a crawl while still allowing steady throughput.
+			time.AfterFunc(time.Millisecond, onSent)
+		}
+		freeTraffic(tr)
+	default:
+		// Non-traffic packets (pathNotify, pathBroken) — nothing to free
+	}
 }
 
 func (p *peer) pop() {
@@ -446,9 +477,6 @@ func (p *peer) pop() {
 			p.writer.sendPacket(info.packet.wireType(), info.packet, nil)
 		} else {
 			p.ready = true
-			p.writer.Act(nil, func() {
-				p.writer.wbuf.Flush()
-			})
 		}
 	})
 }

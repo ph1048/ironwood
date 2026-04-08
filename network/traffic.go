@@ -13,11 +13,15 @@ type traffic struct {
 	dest      publicKey
 	watermark uint64
 	payload   []byte
+	onFree    func() // called when traffic is freed (cleanup)
+	onSent    func() // called only when successfully written to wire (flow control)
 }
 
 func (tr *traffic) copyFrom(original *traffic) {
 	tmp := *tr
 	*tr = *original
+	tr.onFree = nil // copies don't own cleanup
+	tr.onSent = nil // copies don't own flow control
 	tr.path = append(tmp.path[:0], tr.path...)
 	tr.from = append(tmp.from[:0], tr.from...)
 	tr.payload = append(tmp.payload[:0], tr.payload...)

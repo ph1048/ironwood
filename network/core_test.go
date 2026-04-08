@@ -328,8 +328,8 @@ type dummyConn struct {
 }
 
 func newDummyConn(keyA, keyB ed25519.PublicKey) (*dummyConn, *dummyConn) {
-	toA := make(chan []byte)
-	toB := make(chan []byte)
+	toA := make(chan []byte, 4096)
+	toB := make(chan []byte, 4096)
 	cl := new(sync.Mutex)
 	closed := make(chan struct{})
 	connA := dummyConn{recv: toA, send: toB, closeLock: cl, closed: closed}

@@ -64,6 +64,10 @@ func (pc *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if uint64(len(p)) > pc.MTU() {
 		return 0, types.ErrOversizedMessage
 	}
+	// Ensure the network read loop is running — it processes session
+	// init/ack messages needed for WriteTo to establish sessions.
+	// Without this, WriteTo cannot work unless ReadFrom is also called.
+	pc.network.read()
 	n = len(p)
 	var dest edPub
 	copy(dest[:], destKey)

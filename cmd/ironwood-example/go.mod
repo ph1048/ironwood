@@ -1,6 +1,6 @@
 module github.com/Arceliar/ironwood-example
 
-go 1.16
+go 1.26.1
 
 replace github.com/Arceliar/ironwood => ../../
 

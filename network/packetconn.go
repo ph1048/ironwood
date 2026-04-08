@@ -17,15 +17,17 @@ func _type_asserts_() {
 }
 
 type PacketConn struct {
-	actor        phony.Inbox
-	core         *core
-	recv         chan *traffic //read buffer
-	recvReady    uint64
-	recvq        packetQueue
-	readDeadline *deadline
-	closeMutex   sync.Mutex
-	closed       chan struct{}
-	Debug        Debug
+	actor           phony.Inbox
+	core            *core
+	recv            chan *traffic //read buffer
+	recvReady       uint64
+	recvq           packetQueue
+	readDeadline    *deadline
+	closeMutex      sync.Mutex
+	closed          chan struct{}
+	writeSem        chan struct{} // backpressure semaphore; nil if no limit
+	writeSemRelease func()       // pre-allocated closure for semaphore release
+	Debug           Debug
 }
 
 // NewPacketConn returns a *PacketConn struct which implements the types.PacketConn interface.
@@ -42,7 +44,16 @@ func (pc *PacketConn) init(c *core) {
 	pc.recv = make(chan *traffic, 1)
 	pc.readDeadline = newDeadline()
 	pc.closed = make(chan struct{})
+	if c.config.maxInflightWrites > 0 {
+		pc.writeSem = make(chan struct{}, c.config.maxInflightWrites)
+		pc.writeSemRelease = func() { <-pc.writeSem }
+	}
 	pc.Debug.init(c)
+}
+
+// GetCipherMode returns the configured cipher mode for session traffic.
+func (pc *PacketConn) GetCipherMode() CipherMode {
+	return pc.core.config.cipherMode
 }
 
 // ReadFrom fulfills the net.PacketConn interface, with a types.Addr returned as the from address.
@@ -85,7 +96,18 @@ func (pc *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if uint64(len(p)) > pc.MTU() {
 		return 0, types.ErrOversizedMessage
 	}
+	// Backpressure: block when too many packets are in-flight
+	if pc.writeSem != nil {
+		select {
+		case pc.writeSem <- struct{}{}:
+		case <-pc.closed:
+			return 0, types.ErrClosed
+		}
+	}
 	tr := allocTraffic()
+	if pc.writeSemRelease != nil {
+		tr.onSent = pc.writeSemRelease
+	}
 	tr.source = pc.core.crypto.publicKey
 	copy(tr.dest[:], dest)
 	tr.watermark = ^uint64(0)
@@ -210,10 +232,22 @@ func (pc *PacketConn) handleTraffic(from phony.Actor, tr *traffic) {
 			case <-pc.closed:
 			}
 		} else {
-			if info, ok := pc.recvq.peek(); ok && time.Since(info.time) > 25*time.Millisecond {
-				// The queue already has a significant delay
-				// Drop the oldest packet from the larget queue to make room
-				pc.recvq.drop()
+			maxSize := pc.core.config.peerMaxQueueSize
+			for pc.recvq.size > 0 && pc.recvq.size+uint64(tr.size()) > maxSize {
+				dropped, ok := pc.recvq.drop()
+				if !ok {
+					break
+				}
+				if dtr, ok := dropped.(*traffic); ok {
+					freeTraffic(dtr)
+				}
+			}
+			if info, ok := pc.recvq.peek(); ok && time.Since(info.time) > pc.core.config.peerQueueTimeout {
+				if dropped, ok := pc.recvq.drop(); ok {
+					if dtr, ok := dropped.(*traffic); ok {
+						freeTraffic(dtr)
+					}
+				}
 			}
 			pc.recvq.push(tr)
 		}

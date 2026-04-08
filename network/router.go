@@ -79,7 +79,7 @@ func (r *router) init(c *core) {
 	r.responded = make(map[*peer]struct{})
 	r.resSeqs = make(map[publicKey]uint64)
 	// Kick off actor to do initial work / become root
-	r.mainTimer = time.AfterFunc(time.Second, func() {
+	r.mainTimer = time.AfterFunc(r.core.config.maintenanceInterval, func() {
 		r.Act(nil, r._doMaintenance)
 	})
 	r.doRoot2 = true
@@ -96,7 +96,7 @@ func (r *router) _doMaintenance() {
 	r._fix()           // Selects new parent, if needed
 	r._sendAnnounces() // Sends announcements to peers, if needed
 	r.blooms._doMaintenance()
-	r.mainTimer.Reset(time.Second)
+	r.mainTimer.Reset(r.core.config.maintenanceInterval)
 }
 
 func (r *router) _shutdown() {
@@ -595,6 +595,7 @@ func (r *router) handleTraffic(from phony.Actor, tr *traffic) {
 			p.sendTraffic(r, tr)
 		} else if tr.dest == r.core.crypto.publicKey {
 			r.pathfinder._resetTimeout(tr.source)
+			r.pathfinder._learnReversePath(tr.source, tr.from)
 			r.core.pconn.handleTraffic(r, tr)
 		} else {
 			// Not addressed to us, and we don't know a next hop.

@@ -25,22 +25,24 @@ type pqSource struct {
 }
 
 type pqDest struct {
-	key     publicKey
-	sources []pqSource
-	size    uint64
+	key       publicKey
+	sources   []pqSource
+	size      uint64
+	sourceIdx map[publicKey]int // O(1) source lookup by key
 }
 
 type packetQueue struct {
-	dests []pqDest
-	size  uint64
+	dests    []pqDest
+	size     uint64
+	destIdx  map[publicKey]int // O(1) destination lookup by key
 }
 
 // drop will remove a packet from the queue
 // the packet removed will be the oldest packet from the longest stream to the largest destination queue
 // returns true if a packet was removed, false otherwise
-func (q *packetQueue) drop() bool {
+func (q *packetQueue) drop() (pqPacket, bool) {
 	if q.size == 0 {
-		return false
+		return nil, false
 	}
 	var dIdx int
 	for idx := range q.dests {
@@ -75,13 +77,7 @@ func (q *packetQueue) drop() bool {
 		heap.Remove(q, dIdx)
 	}
 	q.size -= info.size
-	switch p := info.packet.(type) {
-	case *traffic:
-		freeTraffic(p)
-	default:
-		// Nothing to do
-	}
-	return true
+	return info.packet, true
 }
 
 // push adds a packet with the provided size to a queue for the provided source and destination keys
@@ -93,27 +89,33 @@ func (q *packetQueue) push(packet pqPacket) {
 	info := pqPacketInfo{packet: packet, size: uint64(size), time: time.Now()}
 	sIdx, dIdx := -1, -1
 	source, dest := pqSource{key: sKey}, pqDest{key: dKey}
-	for idx, d := range q.dests {
-		if d.key.equal(dKey) {
-			dIdx, dest = idx, d
-			break
+	if q.destIdx != nil {
+		if idx, ok := q.destIdx[dKey]; ok {
+			dIdx, dest = idx, q.dests[idx]
 		}
 	}
-	for idx, s := range dest.sources {
-		if s.key.equal(sKey) {
-			sIdx, source = idx, s
-			break
+	if dest.sourceIdx != nil {
+		if idx, ok := dest.sourceIdx[sKey]; ok {
+			sIdx, source = idx, dest.sources[idx]
 		}
 	}
 	source.infos = append(source.infos, info)
 	source.size += info.size
 	if sIdx < 0 {
+		if dest.sourceIdx == nil {
+			dest.sourceIdx = make(map[publicKey]int)
+		}
+		dest.sourceIdx[sKey] = len(dest.sources)
 		dest.sources = append(dest.sources, source)
 	} else {
 		dest.sources[sIdx] = source
 	}
 	dest.size += info.size
 	if dIdx < 0 {
+		if q.destIdx == nil {
+			q.destIdx = make(map[publicKey]int)
+		}
+		q.destIdx[dKey] = len(q.dests)
 		q.dests = append(q.dests, dest)
 	} else {
 		q.dests[dIdx] = dest
@@ -171,10 +173,17 @@ func (q *packetQueue) Less(i, j int) bool {
 
 func (q *packetQueue) Swap(i, j int) {
 	q.dests[i], q.dests[j] = q.dests[j], q.dests[i]
+	if q.destIdx != nil {
+		q.destIdx[q.dests[i].key] = i
+		q.destIdx[q.dests[j].key] = j
+	}
 }
 
 func (q *packetQueue) Push(x interface{}) {
 	dest := x.(pqDest)
+	if q.destIdx != nil {
+		q.destIdx[dest.key] = len(q.dests)
+	}
 	q.dests = append(q.dests, dest)
 	q.size += dest.size
 }
@@ -184,6 +193,9 @@ func (q *packetQueue) Pop() interface{} {
 	dest := q.dests[idx]
 	q.dests = q.dests[:idx]
 	q.size -= dest.size
+	if q.destIdx != nil {
+		delete(q.destIdx, dest.key)
+	}
 	return dest
 }
 
@@ -199,10 +211,17 @@ func (d *pqDest) Less(i, j int) bool {
 
 func (d *pqDest) Swap(i, j int) {
 	d.sources[i], d.sources[j] = d.sources[j], d.sources[i]
+	if d.sourceIdx != nil {
+		d.sourceIdx[d.sources[i].key] = i
+		d.sourceIdx[d.sources[j].key] = j
+	}
 }
 
 func (d *pqDest) Push(x interface{}) {
 	source := x.(pqSource)
+	if d.sourceIdx != nil {
+		d.sourceIdx[source.key] = len(d.sources)
+	}
 	d.sources = append(d.sources, source)
 	d.size += source.size
 }
@@ -212,5 +231,8 @@ func (d *pqDest) Pop() interface{} {
 	source := d.sources[idx]
 	d.sources = d.sources[:idx]
 	d.size -= source.size
+	if d.sourceIdx != nil {
+		delete(d.sourceIdx, source.key)
+	}
 	return source
 }

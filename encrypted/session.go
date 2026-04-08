@@ -2,12 +2,33 @@ package encrypted
 
 import (
 	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/Arceliar/phony"
 
+	"github.com/Arceliar/ironwood/network"
 	"github.com/Arceliar/ironwood/types"
 )
+
+// SessionLogFunc is a package-level log function for session trace logging.
+// If set, [IW-SESSION] messages go through this instead of stderr.
+var SessionLogFunc func(msg string)
+
+func sessionLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if SessionLogFunc != nil {
+		SessionLogFunc(msg)
+	} else {
+		fmt.Fprint(os.Stderr, msg)
+	}
+}
+
+func shortKey(k edPub) string {
+	return hex.EncodeToString(k[:])[:8]
+}
 
 /*
 
@@ -37,21 +58,22 @@ const (
 
 type sessionManager struct {
 	phony.Inbox
-	pc       *PacketConn
-	sessions map[edPub]*sessionInfo
-	buffers  map[edPub]*sessionBuffer
+	pc         *PacketConn
+	cipherMode network.CipherMode
+	sessions   map[edPub]*sessionInfo
+	buffers    map[edPub]*sessionBuffer
 }
 
 func (mgr *sessionManager) init(pc *PacketConn) {
 	mgr.pc = pc
+	mgr.cipherMode = pc.PacketConn.GetCipherMode()
 	mgr.sessions = make(map[edPub]*sessionInfo)
 	mgr.buffers = make(map[edPub]*sessionBuffer)
 }
 
 func (mgr *sessionManager) _newSession(ed *edPub, recv, send boxPub, seq uint64) *sessionInfo {
-	info := newSession(ed, recv, send, seq)
+	info := newSession(mgr, ed, recv, send, seq)
 	info.Act(mgr, func() {
-		info.mgr = mgr
 		info._resetTimer()
 	})
 	mgr.sessions[info.ed] = info
@@ -102,9 +124,11 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 }
 
 func (mgr *sessionManager) _handleInit(pub *edPub, init *sessionInit) {
+	sessionLog( "[IW-SESSION] _handleInit from=%s seq=%d\n", shortKey(*pub), init.seq)
 	if info, buf := mgr._sessionForInit(pub, init); info != nil {
 		info.handleInit(mgr, init)
 		if buf != nil && buf.data != nil {
+			sessionLog( "[IW-SESSION] _handleInit: delivering buffered data (%d bytes) to %s\n", len(buf.data), shortKey(*pub))
 			info.doSend(mgr, buf.data)
 		}
 	}
@@ -112,13 +136,16 @@ func (mgr *sessionManager) _handleInit(pub *edPub, init *sessionInit) {
 
 func (mgr *sessionManager) _handleAck(pub *edPub, ack *sessionAck) {
 	_, isOld := mgr.sessions[*pub]
+	sessionLog( "[IW-SESSION] _handleAck from=%s seq=%d existingSession=%v\n", shortKey(*pub), ack.seq, isOld)
 	if info, buf := mgr._sessionForInit(pub, &ack.sessionInit); info != nil {
 		if isOld {
 			info.handleAck(mgr, ack)
 		} else {
+			sessionLog( "[IW-SESSION] _handleAck: NEW session created for %s (treating as init)\n", shortKey(*pub))
 			info.handleInit(mgr, &ack.sessionInit)
 		}
 		if buf != nil && buf.data != nil {
+			sessionLog( "[IW-SESSION] _handleAck: delivering buffered data (%d bytes) to %s\n", len(buf.data), shortKey(*pub))
 			info.doSend(mgr, buf.data)
 		}
 	}
@@ -128,6 +155,7 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 	if info := mgr.sessions[*pub]; info != nil {
 		info.doRecv(mgr, msg)
 	} else {
+		sessionLog( "[IW-SESSION] _handleTraffic: NO SESSION for %s, sending ephemeral init (len=%d)\n", shortKey(*pub), len(msg))
 		// We don't know that the node really exists, it could be spoofed/replay
 		// So we don't want to save session or a buffer based on this node
 		// So we send an init with keys we'll forget
@@ -145,7 +173,11 @@ func (mgr *sessionManager) writeTo(toKey edPub, msg []byte) {
 		if info := mgr.sessions[toKey]; info != nil {
 			info.doSend(mgr, msg)
 		} else {
-			// Need to buffer the traffic
+			sessionLog("[IW-SESSION] writeTo: no session for %s (have %d sessions:", shortKey(toKey), len(mgr.sessions))
+			for k := range mgr.sessions {
+				sessionLog(" %s", shortKey(k))
+			}
+			sessionLog(") buffering+init (len=%d)\n", len(msg))
 			mgr._bufferAndInit(toKey, msg)
 		}
 	})
@@ -153,7 +185,9 @@ func (mgr *sessionManager) writeTo(toKey edPub, msg []byte) {
 
 func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 	var buf *sessionBuffer
+	isNew := false
 	if buf = mgr.buffers[toKey]; buf == nil {
+		isNew = true
 		// Create a new buffer (including timer)
 		buf = new(sessionBuffer)
 		currentPub, currentPriv := newBoxKeys()
@@ -164,28 +198,47 @@ func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 		buf.timer = time.AfterFunc(0, func() {})
 		mgr.buffers[toKey] = buf
 	}
+	// Always keep the latest message (overwrite previous)
+	if buf.data != nil {
+		freeBytes(buf.data)
+	}
 	buf.data = msg
-	buf.timer.Stop()
-	mgr.sendInit(&toKey, &buf.init)
-	buf.timer = time.AfterFunc(sessionTimeout, func() {
-		mgr.Act(nil, func() {
-			if b := mgr.buffers[toKey]; b == buf {
-				b.timer.Stop()
-				delete(mgr.buffers, toKey)
-			}
+	if isNew {
+		// Only send init on first buffer — subsequent writes just update
+		// the buffered data. The init is already in flight and will trigger
+		// session creation when the ack arrives.
+		buf.timer.Stop()
+		sessionLog("[IW-SESSION] _bufferAndInit: sendInit to=%s new=%v seq=%d\n", shortKey(toKey), isNew, buf.init.seq)
+		mgr.sendInit(&toKey, &buf.init)
+		buf.timer = time.AfterFunc(sessionTimeout, func() {
+			mgr.Act(nil, func() {
+				if b := mgr.buffers[toKey]; b == buf {
+					sessionLog("[IW-SESSION] _bufferAndInit: TIMEOUT expired for %s (60s)\n", shortKey(toKey))
+					b.timer.Stop()
+					delete(mgr.buffers, toKey)
+				}
+			})
 		})
-	})
+	} else {
+		sessionLog("[IW-SESSION] _bufferAndInit: buffer updated for %s (init already in flight)\n", shortKey(toKey))
+	}
 }
 
 func (mgr *sessionManager) sendInit(dest *edPub, init *sessionInit) {
 	if bs, err := init.encrypt(&mgr.pc.secretEd, dest); err == nil {
-		mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		n, werr := mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		sessionLog( "[IW-SESSION] sendInit dest=%s seq=%d wrote=%d err=%v\n", shortKey(*dest), init.seq, n, werr)
+	} else {
+		sessionLog( "[IW-SESSION] sendInit dest=%s ENCRYPT FAILED: %v\n", shortKey(*dest), err)
 	}
 }
 
 func (mgr *sessionManager) sendAck(dest *edPub, ack *sessionAck) {
 	if bs, err := ack.encrypt(&mgr.pc.secretEd, dest); err == nil {
-		mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		n, werr := mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		sessionLog( "[IW-SESSION] sendAck dest=%s seq=%d wrote=%d err=%v\n", shortKey(*dest), ack.seq, n, werr)
+	} else {
+		sessionLog( "[IW-SESSION] sendAck dest=%s ENCRYPT FAILED: %v\n", shortKey(*dest), err)
 	}
 }
 
@@ -205,27 +258,33 @@ type sessionInfo struct {
 	recvPriv       boxPriv
 	recvPub        boxPub
 	recvShared     boxShared
+	recvCipher     sessionCipher
 	recvNonce      uint64
 	sendPriv       boxPriv // becomes recvPriv when we ratchet forward
 	sendPub        boxPub  // becomes recvPub
 	sendShared     boxShared
+	sendCipher     sessionCipher
 	sendNonce      uint64
 	nextPriv       boxPriv // becomes sendPriv
 	nextPub        boxPub  // becomes sendPub
 	timer          *time.Timer
+	lastActive     time.Time
 	ack            *sessionAck
 	since          time.Time
 	rotated        time.Time // last time we rotated keys
 	rx             uint64
 	tx             uint64
 	nextSendShared boxShared
+	nextSendCipher sessionCipher
 	nextSendNonce  uint64
 	nextRecvShared boxShared
+	nextRecvCipher sessionCipher
 	nextRecvNonce  uint64
 }
 
-func newSession(ed *edPub, current, next boxPub, seq uint64) *sessionInfo {
+func newSession(mgr *sessionManager, ed *edPub, current, next boxPub, seq uint64) *sessionInfo {
 	info := new(sessionInfo)
+	info.mgr = mgr
 	info.seq = seq - 1 // so the first update works
 	info.ed = *ed
 	info.current, info.next = current, next
@@ -245,15 +304,35 @@ func (info *sessionInfo) _fixShared(recvNonce, sendNonce uint64) {
 	getShared(&info.nextRecvShared, &info.next, &info.recvPriv)
 	info.nextSendNonce, info.nextRecvNonce = 0, 0
 	info.recvNonce, info.sendNonce = recvNonce, sendNonce
+	// Rebuild ciphers from shared secrets
+	info._rebuildCiphers()
+}
+
+func (info *sessionInfo) _rebuildCiphers() {
+	mode := info.mgr.cipherMode
+	info.recvCipher = newSessionCipher(mode, &info.recvShared)
+	info.sendCipher = newSessionCipher(mode, &info.sendShared)
+	info.nextSendCipher = newSessionCipher(mode, &info.nextSendShared)
+	info.nextRecvCipher = newSessionCipher(mode, &info.nextRecvShared)
 }
 
 func (info *sessionInfo) _resetTimer() {
 	if info.timer != nil {
 		info.timer.Stop()
 	}
+	info.lastActive = time.Now()
 	info.timer = time.AfterFunc(sessionTimeout, func() {
 		info.mgr.Act(nil, func() {
 			if oldInfo := info.mgr.sessions[info.ed]; oldInfo == info {
+				// Check if there's been recent send activity that the timer
+				// missed due to actor scheduling delays
+				if time.Since(info.lastActive) < sessionTimeout {
+					// Activity happened after the timer was set — reschedule
+					info.Act(nil, func() {
+						info._resetTimer()
+					})
+					return
+				}
 				delete(info.mgr.sessions, info.ed)
 			}
 		})
@@ -262,9 +341,19 @@ func (info *sessionInfo) _resetTimer() {
 
 func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
 	info.Act(from, func() {
-		if init.seq <= info.seq {
+		if init.seq < info.seq {
+			sessionLog("[IW-SESSION] handleInit: STALE from=%s init.seq=%d < info.seq=%d (DROPPED)\n", shortKey(info.ed), init.seq, info.seq)
 			return
 		}
+		if init.seq == info.seq {
+			// Duplicate init — the client is retrying because our ACK was
+			// likely lost (e.g. reverse routing not yet converged). Resend
+			// the ACK without re-processing keys.
+			sessionLog("[IW-SESSION] handleInit: DUPLICATE from=%s seq=%d, resending ack\n", shortKey(info.ed), init.seq)
+			info._sendAck()
+			return
+		}
+		sessionLog("[IW-SESSION] handleInit: ACCEPT from=%s init.seq=%d, sending ack\n", shortKey(info.ed), init.seq)
 		info._handleUpdate(init)
 		// Send a sessionAck
 		info._sendAck()
@@ -274,8 +363,10 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
 func (info *sessionInfo) handleAck(from phony.Actor, ack *sessionAck) {
 	info.Act(from, func() {
 		if ack.seq <= info.seq {
+			sessionLog( "[IW-SESSION] handleAck: STALE from=%s ack.seq=%d <= info.seq=%d (DROPPED)\n", shortKey(info.ed), ack.seq, info.seq)
 			return
 		}
+		sessionLog( "[IW-SESSION] handleAck: ACCEPT from=%s ack.seq=%d — SESSION READY\n", shortKey(info.ed), ack.seq)
 		info._handleUpdate(&ack.sessionInit)
 	})
 }
@@ -322,7 +413,7 @@ func (info *sessionInfo) doSend(from phony.Actor, msg []byte) {
 		tmp := allocBytes(len(info.nextPub) + len(msg))[:0]
 		tmp = append(tmp, info.nextPub[:]...)
 		tmp = append(tmp, msg...)
-		bs = boxSeal(bs, tmp, info.sendNonce, &info.sendShared)
+		bs = info.sendCipher.Seal(bs, tmp, info.sendNonce)
 		freeBytes(tmp)
 		// send
 		info.mgr.pc.PacketConn.WriteTo(bs, types.Addr(info.ed[:]))
@@ -360,7 +451,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 		fromNext := remoteKeySeq == info.remoteKeySeq+1
 		toRecv := localKeySeq+1 == info.localKeySeq
 		toSend := localKeySeq == info.localKeySeq
-		var sharedKey *boxShared
+		var ciph sessionCipher
 		var onSuccess func(boxPub)
 		switch {
 		case fromCurrent && toRecv:
@@ -368,7 +459,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !(info.recvNonce < nonce) {
 				return
 			}
-			sharedKey = &info.recvShared
+			ciph = info.recvCipher
 			onSuccess = func(_ boxPub) {
 				info.recvNonce = nonce
 			}
@@ -377,7 +468,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !(info.nextSendNonce < nonce) {
 				return
 			}
-			sharedKey = &info.nextSendShared
+			ciph = info.nextSendCipher
 			onSuccess = func(innerKey boxPub) {
 				info.nextSendNonce = nonce
 				if info.rotated.IsZero() || time.Since(info.rotated) > time.Minute {
@@ -403,7 +494,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !(info.nextRecvNonce < nonce) {
 				return
 			}
-			sharedKey = &info.nextRecvShared
+			ciph = info.nextRecvCipher
 			onSuccess = func(innerKey boxPub) {
 				info.nextRecvNonce = nonce
 				if info.rotated.IsZero() || time.Since(info.rotated) > time.Minute {
@@ -431,7 +522,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 		// Decrypt and handle packet
 		unboxed, ok := allocBytes(0), false
 		defer func() { freeBytes(unboxed) }()
-		if unboxed, ok = boxOpen(unboxed, msg, nonce, sharedKey); ok {
+		if unboxed, ok = ciph.Open(unboxed, msg, nonce); ok {
 			var key boxPub
 			copy(key[:], unboxed)
 			msg := append(allocBytes(0), unboxed[len(key):]...)
